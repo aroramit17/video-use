@@ -1,4 +1,9 @@
-"""Transcribe a video with ElevenLabs Scribe.
+"""Transcribe a video with ElevenLabs Scribe (default) or Cloudflare Workers AI (Nova-3).
+
+Pick the provider with TRANSCRIBE_PROVIDER=elevenlabs|cloudflare in .env or the
+environment. If unset, it uses Cloudflare when CLOUDFLARE_API_TOKEN is present and
+ElevenLabs otherwise. Both write the same Scribe-shaped JSON, so the rest of the
+pipeline is unchanged.
 
 Extracts mono 16kHz audio via ffmpeg, uploads to Scribe with verbatim +
 diarize + audio events + word-level timestamps, writes the full response
@@ -33,7 +38,8 @@ import requests
 SCRIBE_URL = "https://api.elevenlabs.io/v1/speech-to-text"
 
 
-def load_api_key() -> str:
+def _env(name: str) -> str:
+    """Value of `name` from .env (repo dir, then cwd) or the environment; '' if unset."""
     for candidate in [Path(__file__).resolve().parent.parent / ".env", Path(".env")]:
         if candidate.exists():
             for line in candidate.read_text().splitlines():
@@ -41,9 +47,26 @@ def load_api_key() -> str:
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 k, v = line.split("=", 1)
-                if k.strip() == "ELEVENLABS_API_KEY":
+                if k.strip() == name:
                     return v.strip().strip('"').strip("'")
-    v = os.environ.get("ELEVENLABS_API_KEY", "")
+    return os.environ.get(name, "")
+
+
+def provider() -> str:
+    p = _env("TRANSCRIBE_PROVIDER").lower()
+    if p in ("elevenlabs", "cloudflare"):
+        return p
+    return "cloudflare" if _env("CLOUDFLARE_API_TOKEN") else "elevenlabs"
+
+
+def load_api_key() -> str:
+    """Credential for the active provider (ElevenLabs key or Cloudflare API token)."""
+    if provider() == "cloudflare":
+        v = _env("CLOUDFLARE_API_TOKEN")
+        if not v or not _env("CLOUDFLARE_ACCOUNT_ID"):
+            sys.exit("CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID not found in .env or environment")
+        return v
+    v = _env("ELEVENLABS_API_KEY")
     if not v:
         sys.exit("ELEVENLABS_API_KEY not found in .env or environment")
     return v
@@ -87,6 +110,17 @@ def call_scribe(
     language: str | None = None,
     num_speakers: int | None = None,
 ) -> dict:
+    if provider() == "cloudflare":
+        from cloudflare_stt import DEFAULT_MODEL, transcribe_audio
+        return transcribe_audio(
+            audio_path,
+            account=_env("CLOUDFLARE_ACCOUNT_ID"),
+            token=api_key,
+            model=_env("CLOUDFLARE_STT_MODEL") or DEFAULT_MODEL,
+            language=language,
+            num_speakers=num_speakers,
+        )
+
     data: dict[str, str] = {
         "model_id": "scribe_v1",
         "diarize": "true",
@@ -190,7 +224,7 @@ def transcribe_one(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Transcribe a video with ElevenLabs Scribe")
+    ap = argparse.ArgumentParser(description="Transcribe a video (ElevenLabs Scribe or Cloudflare Nova-3)")
     ap.add_argument("video", type=Path, help="Path to video file")
     ap.add_argument(
         "--edit-dir",
